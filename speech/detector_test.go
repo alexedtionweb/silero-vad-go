@@ -132,6 +132,7 @@ func TestSpeechDetection(t *testing.T) {
 	samples2 := readSamplesFromFile("../testfiles/samples2.pcm")
 
 	t.Run("detect", func(t *testing.T) {
+		require.NoError(t, sd.Reset())
 		segments, err := sd.Detect(samples)
 		require.NoError(t, err)
 		require.NotEmpty(t, segments)
@@ -217,5 +218,157 @@ func TestSpeechDetection(t *testing.T) {
 				SpeechEndAt:   0,
 			},
 		}, segments)
+	})
+}
+
+func TestSpeechStreaming(t *testing.T) {
+	cfg := DetectorConfig{
+		ModelPath:  "../testfiles/silero_vad.onnx",
+		SampleRate: 16000,
+		Threshold:  0.5,
+	}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
+		AddSource: true,
+		Level:     slog.LevelDebug,
+	}))
+	slog.SetDefault(logger)
+
+	readSamplesFromFile := func(path string) []float32 {
+		data, err := os.ReadFile(path)
+		require.NoError(t, err)
+
+		samples := make([]float32, 0, len(data)/4)
+		for i := 0; i < len(data); i += 4 {
+			samples = append(samples, math.Float32frombits(binary.LittleEndian.Uint32(data[i:i+4])))
+		}
+		return samples
+	}
+
+	samples := readSamplesFromFile("../testfiles/samples.pcm")
+	samples2 := readSamplesFromFile("../testfiles/samples2.pcm")
+
+	segmentsAlmostEqual := func(a, b []Segment, tol float64) bool {
+		if len(a) != len(b) {
+			return false
+		}
+		for i := range a {
+			if math.Abs(a[i].SpeechStartAt-b[i].SpeechStartAt) > tol {
+				return false
+			}
+			if math.Abs(a[i].SpeechEndAt-b[i].SpeechEndAt) > tol {
+				return false
+			}
+		}
+		return true
+	}
+
+	// Helper: stream frames into StreamV2 and collect events
+	streamV2Events := func(sd *Detector, samples []float32, windowSize int) []VADIteratorEvent {
+		var events []VADIteratorEvent
+		for i := 0; i+windowSize <= len(samples); i += windowSize {
+			frame := samples[i : i+windowSize]
+			event, err := sd.DetectStreamFrame(frame)
+			require.NoError(t, err)
+			if event != nil {
+				events = append(events, *event)
+			}
+		}
+		// Flush silence
+		for i := 0; i < 10; i++ {
+			silence := make([]float32, windowSize)
+			event, err := sd.DetectStreamFrame(silence)
+			require.NoError(t, err)
+			if event != nil {
+				events = append(events, *event)
+			}
+		}
+		return events
+	}
+
+	t.Run("streaming", func(t *testing.T) {
+		sd, err := NewDetector(cfg)
+		require.NoError(t, err)
+		defer func() { require.NoError(t, sd.Destroy()) }()
+
+		require.NoError(t, sd.Reset())
+		events := streamV2Events(sd, samples, 512)
+		require.NotEmpty(t, events)
+
+		var foundStart, foundEnd bool
+		for _, ev := range events {
+			if ev.IsStart {
+				foundStart = true
+			}
+			if ev.IsEnd {
+				foundEnd = true
+			}
+		}
+		require.True(t, foundStart, "should have at least one start event")
+		require.True(t, foundEnd, "should have at least one end event")
+	})
+
+	t.Run("streaming with samples2", func(t *testing.T) {
+		sd, err := NewDetector(cfg)
+		require.NoError(t, err)
+		defer func() { require.NoError(t, sd.Destroy()) }()
+
+		require.NoError(t, sd.Reset())
+		events := streamV2Events(sd, samples2, 512)
+		require.NotEmpty(t, events)
+	})
+
+	t.Run("streaming reset", func(t *testing.T) {
+		sd, err := NewDetector(cfg)
+		require.NoError(t, err)
+		defer func() { require.NoError(t, sd.Destroy()) }()
+
+		require.NoError(t, sd.Reset())
+		events1 := streamV2Events(sd, samples, 512)
+		require.NotEmpty(t, events1)
+
+		require.NoError(t, sd.Reset())
+		events2 := streamV2Events(sd, samples, 512)
+		require.NotEmpty(t, events2)
+	})
+
+	t.Run("streaming speech padding", func(t *testing.T) {
+		cfg2 := cfg
+		cfg2.SpeechPadMs = 10
+		sd, err := NewDetector(cfg2)
+		require.NoError(t, err)
+		defer func() { require.NoError(t, sd.Destroy()) }()
+
+		require.NoError(t, sd.Reset())
+		events := streamV2Events(sd, samples, 512)
+		require.NotEmpty(t, events)
+
+		// Convert events to segments using sample indices and sample rate
+		var segments []Segment
+		var current Segment
+		for _, ev := range events {
+			if ev.IsStart {
+				current = Segment{
+					SpeechStartAt: float64(ev.StartSample) / float64(cfg2.SampleRate),
+				}
+			}
+			if ev.IsEnd {
+				current.SpeechEndAt = float64(ev.EndSample) / float64(cfg2.SampleRate)
+				segments = append(segments, current)
+				current = Segment{}
+			}
+		}
+		// If a segment was started but not ended (open segment), add it
+		if current.SpeechStartAt != 0 && current.SpeechEndAt == 0 {
+			segments = append(segments, current)
+		}
+
+		//  512-sample frames, you must accept that boundaries will differ by up to ±1 frame (32ms).
+		expected := []Segment{
+			{SpeechStartAt: 1.046, SpeechEndAt: 1.61},
+			{SpeechStartAt: 2.87, SpeechEndAt: 3.21},
+			{SpeechStartAt: 4.438, SpeechEndAt: 4.874},
+		}
+		const tol = 0.04 // 40 ms tolerance
+		require.True(t, segmentsAlmostEqual(expected, segments, tol), "segments not within tolerance:\nexpected: %#v\nactual: %#v", expected, segments)
 	})
 }

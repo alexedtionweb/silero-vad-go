@@ -198,6 +198,8 @@ func (sd *Detector) Detect(pcm []float32) ([]Segment, error) {
 	var segments []Segment
 	for i := 0; i < len(pcm)-windowSize; i += windowSize {
 		speechProb, err := sd.Infer(pcm[i : i+windowSize])
+		fmt.Printf("Detect batch frame %d: speechProb=%.3f\n", i, speechProb)
+
 		if err != nil {
 			return nil, fmt.Errorf("infer failed: %w", err)
 		}
@@ -287,4 +289,62 @@ func (sd *Detector) Destroy() error {
 	}
 
 	return nil
+}
+
+type VADIteratorEvent struct {
+	StartSample int
+	EndSample   int
+	IsStart     bool
+	IsEnd       bool
+}
+
+func (sd *Detector) DetectStreamFrame(frame []float32) (*VADIteratorEvent, error) {
+	windowSize := 512
+	if sd.cfg.SampleRate == 8000 {
+		windowSize = 256
+	}
+	if len(frame) != windowSize {
+		return nil, fmt.Errorf("frame must be %d samples for sample rate %d", windowSize, sd.cfg.SampleRate)
+	}
+
+	minSilenceSamples := sd.cfg.MinSilenceDurationMs * sd.cfg.SampleRate / 1000
+	speechPadSamples := sd.cfg.SpeechPadMs * sd.cfg.SampleRate / 1000
+
+	speechProb, err := sd.Infer(frame)
+	if err != nil {
+		return nil, fmt.Errorf("infer failed: %w", err)
+	}
+
+	sd.currSample += windowSize
+
+	if speechProb >= sd.cfg.Threshold && sd.tempEnd != 0 {
+		sd.tempEnd = 0
+	}
+
+	if speechProb >= sd.cfg.Threshold && !sd.triggered {
+		sd.triggered = true
+		speechStartAt := max(sd.currSample-speechPadSamples-windowSize, 0)
+		return &VADIteratorEvent{
+			StartSample: speechStartAt,
+			IsStart:     true,
+		}, nil
+	}
+
+	if speechProb < (sd.cfg.Threshold-0.15) && sd.triggered {
+		if sd.tempEnd == 0 {
+			sd.tempEnd = sd.currSample
+		}
+		if sd.currSample-sd.tempEnd < minSilenceSamples {
+			return nil, nil // not enough silence yet
+		}
+		speechEndAt := sd.tempEnd + speechPadSamples - windowSize
+		sd.tempEnd = 0
+		sd.triggered = false
+		return &VADIteratorEvent{
+			EndSample: speechEndAt,
+			IsEnd:     true,
+		}, nil
+	}
+
+	return nil, nil
 }
