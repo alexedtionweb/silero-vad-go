@@ -132,7 +132,6 @@ func TestSpeechDetection(t *testing.T) {
 	samples2 := readSamplesFromFile("../testfiles/samples2.pcm")
 
 	t.Run("detect", func(t *testing.T) {
-		require.NoError(t, sd.Reset())
 		segments, err := sd.Detect(samples)
 		require.NoError(t, err)
 		require.NotEmpty(t, segments)
